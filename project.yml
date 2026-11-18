@@ -1,0 +1,85 @@
+name: Unlim
+
+# XcodeGen project — packaging pattern taken from g8row/PhotosBackup
+# (project.yml, Scripts/make-ipa.sh, .github/workflows/release.yml).
+# Only the packaging is reused; the app itself is a Telegram Saved Messages
+# client built on TDLibKit. The project is generated on the CI runner
+# (`xcodegen generate`) and on a Mac for local builds.
+
+options:
+  # TODO: change to your own bundle id prefix before any public release.
+  bundleIdPrefix: com.adit.unlim
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  minimumXcodeGenVersion: "2.40.0"
+
+packages:
+  TDLibKit:
+    url: https://github.com/Swiftgram/TDLibKit
+    # Pin an exact release. This tag was verified in the research report
+    # (2026-11-18); check https://github.com/Swiftgram/TDLibKit/releases
+    # for a newer 1.8.69-based tag before the first build and bump it here.
+    version: 1.5.2-tdlib-1.8.66-d8d46dfa
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1"
+    # TODO(verify): the research report could not confirm the minimum iOS
+    # deployment target of the Swiftgram TDLibFramework XCFramework
+    # (TDLibKit needs iOS 13+; the XCFramework floor is somewhere <= 11).
+    # If the first CI build complains about the framework's minimum, bump
+    # this target to match the framework's Info.plist.
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    # No signing in this project: CI builds with CODE_SIGNING_ALLOWED=NO
+    # and SideStore/AltStore re-sign on device. Local simulator builds
+    # need no team; local device builds need a DEVELOPMENT_TEAM added here.
+    CODE_SIGN_STYLE: Manual
+
+targets:
+  Unlim:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/Unlim/App
+      - path: Sources/Unlim/TDLib
+      - path: Sources/Unlim/Models
+      - path: Sources/Unlim/Services
+      - path: Sources/Unlim/Background
+      # The real credentials file is gitignored and usually absent on a
+      # fresh clone; `optional: true` keeps `xcodegen generate` working
+      # without it. The app shows a setup screen when it is missing.
+      - path: Sources/Unlim/Resources/TelegramConfig.plist
+        buildPhase: resources
+        optional: true
+    settings:
+      base:
+        INFOPLIST_FILE: Sources/Unlim/Resources/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.adit.unlim
+        GENERATE_INFOPLIST_FILE: NO
+    dependencies:
+      - package: TDLibKit
+  UnlimTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/UnlimTests
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.adit.unlim.tests
+    dependencies:
+      - target: Unlim
+
+schemes:
+  Unlim:
+    build:
+      targets:
+        Unlim: all
+        UnlimTests: [test]
+    test:
+      targets:
+        - UnlimTests

@@ -1,0 +1,15 @@
+# Credentials — never commit the real config (see README.md).
+Sources/Unlim/Resources/TelegramConfig.plist
+
+# Build products
+build/
+*.xcodeproj/
+DerivedData/
+*.ipa
+*.dSYM.zip
+
+# macOS / Xcode
+.DS_Store
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/

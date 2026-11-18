@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Copy this file to Sources/Unlim/Resources/TelegramConfig.plist and
+	     fill in your OWN keys from https://my.telegram.org — never commit
+	     the real file, and never reuse UnLim's (or anyone else's) keys. -->
+	<key>api_id</key>
+	<integer>0</integer>
+	<key>api_hash</key>
+	<string>PASTE_YOUR_API_HASH_HERE</string>
+</dict>
+</plist>
