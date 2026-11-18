@@ -1,0 +1,115 @@
+# iOS CI — structure adapted from PhotosBackup's release.yml.
+# Runs unit tests on the simulator, then builds an unsigned IPA for
+# SideStore / AltStore. No Mac is needed locally; everything runs here.
+name: ios
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Unit tests (simulator)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # The Xcode pin follows TDLibFramework's own CI (Xcode 16.4 on
+      # macos-15). A missing pin fails the build instead of silently
+      # falling back to whatever the runner image ships.
+      - name: Select Xcode
+        run: |
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "::error::$XCODE_APP is not on this runner. Available:"
+            ls -d /Applications/Xcode*.app >&2 || true
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$XCODE_APP/Contents/Developer" xcodebuild -version
+        env:
+          XCODE_APP: /Applications/Xcode_16.4.app
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Cache SPM
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles('project.yml') }}
+          restore-keys: ${{ runner.os }}-spm-
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Run unit tests
+        run: |
+          xcodebuild test -project Unlim.xcodeproj -scheme Unlim \
+            -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.5' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+  build-ipa:
+    name: Build unsigned IPA
+    needs: test
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select Xcode
+        run: |
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "::error::$XCODE_APP is not on this runner. Available:"
+            ls -d /Applications/Xcode*.app >&2 || true
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$XCODE_APP/Contents/Developer" xcodebuild -version
+        env:
+          XCODE_APP: /Applications/Xcode_16.4.app
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Cache SPM
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles('project.yml') }}
+          restore-keys: ${{ runner.os }}-spm-
+
+      - name: Build unsigned IPA
+        run: Scripts/make-ipa.sh
+
+      - name: Checksum
+        run: |
+          shasum -a 256 build/Unlim.ipa | awk '{print $1}' > build/Unlim.ipa.sha256
+          echo "sha256: $(cat build/Unlim.ipa.sha256)"
+
+      - name: Attach IPA and checksum to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            build/Unlim.ipa build/Unlim.ipa.sha256 --clobber
+          echo "Attached to release $GITHUB_REF_NAME"
+
+      - name: Upload workflow artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unlim-ipa
+          path: |
+            build/Unlim.ipa
+            build/Unlim.ipa.sha256
+          if-no-files-found: error
