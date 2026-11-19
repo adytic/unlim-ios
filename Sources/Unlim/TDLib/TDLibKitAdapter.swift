@@ -3,23 +3,52 @@ import TDLibKit
 
 /// The ONLY file in this project that talks to TDLibKit directly.
 ///
-/// TODO(TDLibKit) — READ THIS FIRST:
-/// Every generated name used here is derived from the TL method/type names
-/// in https://core.telegram.org/tdlib/docs and the call pattern in the
-/// TDLibKit README (`TDLibClientManager`, `createClient(updateHandler:)`,
-/// `client.getChatHistory(chatId:fromMessageId:limit:offset:onlyLocal:)`).
-/// The research report (2026-11-18) could NOT verify the exact generated
-/// Swift spellings. After the first `xcodegen generate` + SPM resolve, open
-/// the generated sources under
-/// DerivedData/.../SourcePackages/checkouts/TDLibKit/Sources and fix any
-/// name that does not match. The rest of the app only sees the
-/// `TelegramClient` protocol, so fixes stay in this file.
+/// Verified against the generated sources of TDLibKit
+/// 1.5.2-tdlib-1.8.66-d8d46dfa (2026-11-19, after CI run #2 failed to
+/// compile). The names below are the real generated spellings, not guesses:
+/// - `TDLibClientManager.createClient(updateHandler:)` takes
+///   `(Data, TDLibClient) -> Void`.
+/// - `setTdlibParameters` takes flattened optional params, not a
+///   `TdlibParameters` object; `apiVersion`, `enableStorageOptimizer` and
+///   `ignoreBackgroundUpdates` are not parameters in 1.8.66.
+/// - Phone auth settings are `PhoneNumberAuthenticationSettings`
+///   (7 fields), not `AuthenticationCodeSettings`.
+/// - `requestQrCodeAuthentication` returns `Ok`; the QR link arrives in
+///   `updateAuthorizationState` →
+///   `authorizationStateWaitOtherDeviceConfirmation.link`.
+/// - There is no `getSavedMessagesTopics` getter: call
+///   `loadSavedMessagesTopics` and collect the topics from the
+///   `updateSavedMessagesTopic` updates (count via
+///   `updateSavedMessagesTopicCount`).
+/// - `SavedMessagesTopicType` has no author case in 1.8.66: MyNotes /
+///   AuthorHidden / SavedFromChat(chatId). A topic's identity is its
+///   `topic.id` — use that for history calls, not a derived id.
+/// - `File.id` is `Int`; `Messages.messages` is optional.
+/// - `InputMessageDocument` takes `(caption, document: InputDocument)`;
+///   the file/thumbnail/disableContentTypeDetection fields live on
+///   `InputDocument`. `FormattedText.entities` is a non-optional array.
+/// - `sendMessage` takes `topicId: MessageTopic`, not `messageThreadId`.
+/// - `AuthorizationState` cases with payloads (waitCode, waitPassword,
+///   waitRegistration, waitOtherDeviceConfirmation, waitPremiumPurchase,
+///   waitEmailAddress, waitEmailCode) must be matched with `(_)`.
+/// The rest of the app only sees the `TelegramClient` protocol, so fixes
+/// stay in this file.
+///
+/// Still unverified without a real login: whether `Update` decodes from
+/// the raw `Data` the handler receives, and the wait timeouts below
+/// (30 s for the QR link, 5 s for the topic list).
 final class TDLibKitAdapter: TelegramClient {
     enum AdapterError: LocalizedError {
         case noClient
+        case timeout
 
         var errorDescription: String? {
-            "TDLib client is not available."
+            switch self {
+            case .noClient:
+                return "TDLib client is not available."
+            case .timeout:
+                return "Timed out waiting for a reply from TDLib."
+            }
         }
     }
 
@@ -28,12 +57,21 @@ final class TDLibKitAdapter: TelegramClient {
     private let updatesContinuation: AsyncStream<TDLibUpdate>.Continuation
     let updates: AsyncStream<TDLibUpdate>
 
+    /// State for the async waits below (QR link, topic list). Guarded by
+    /// `waitLock`; a continuation is always removed from its table before
+    /// it is resumed, so none is ever resumed twice.
+    private let waitLock = NSLock()
+    private var qrLink: String?
+    private var qrWaiters: [UUID: CheckedContinuation<String, Error>] = [:]
+    private var topicsCache: [Int64: SavedMessagesTopic] = [:]
+    private var topicsExpectedCount: Int?
+    private var topicsWaiters: [UUID: CheckedContinuation<[SavedTopic], Never>] = [:]
+
     init() {
         var continuation: AsyncStream<TDLibUpdate>.Continuation!
         updates = AsyncStream { continuation = $0 }
         updatesContinuation = continuation
-        // TODO(TDLibKit): verify createClient(updateHandler:) delivers raw Data.
-        client = manager.createClient { [weak self] data in
+        client = manager.createClient { [weak self] data, _ in
             self?.handleUpdateData(data)
         }
     }
@@ -41,12 +79,12 @@ final class TDLibKitAdapter: TelegramClient {
     // MARK: - Updates
 
     private func handleUpdateData(_ data: Data) {
-        // TODO(TDLibKit): verify Update decodes from the raw Data the
-        // handler receives, and verify the case payload shapes below
-        // (each case carries its TL struct, e.g. UpdateNewMessage.message).
         guard let update = try? JSONDecoder().decode(Update.self, from: data) else { return }
         switch update {
         case .updateAuthorizationState(let payload):
+            if case .authorizationStateWaitOtherDeviceConfirmation(let conf) = payload.authorizationState {
+                deliverQrLink(conf.link)
+            }
             updatesContinuation.yield(.authorizationState(mapAuthState(payload.authorizationState)))
         case .updateNewMessage(let payload):
             updatesContinuation.yield(.newMessage(mapMessage(payload.message)))
@@ -56,8 +94,17 @@ final class TDLibKitAdapter: TelegramClient {
             updatesContinuation.yield(.messageSendFailed(oldMessageId: payload.oldMessageId))
         case .updateFile(let payload):
             updatesContinuation.yield(.fileUpdated(mapFile(payload.file)))
-        case .updateSavedMessagesTopic:
+        case .updateSavedMessagesTopic(let payload):
+            waitLock.lock()
+            topicsCache[payload.topic.id] = payload.topic
+            waitLock.unlock()
             updatesContinuation.yield(.savedMessagesTopicChanged)
+            maybeResumeTopics()
+        case .updateSavedMessagesTopicCount(let payload):
+            waitLock.lock()
+            topicsExpectedCount = payload.topicCount
+            waitLock.unlock()
+            maybeResumeTopics()
         case .updateDeleteMessages(let payload):
             updatesContinuation.yield(.deleteMessages(chatId: payload.chatId, messageIds: payload.messageIds))
         default:
@@ -65,17 +112,19 @@ final class TDLibKitAdapter: TelegramClient {
         }
     }
 
-    // TODO(TDLibKit): verify the AuthorizationState enum case spellings and
-    // whether each case carries a payload (use `case .authorizationStateWaitCode(_):`
-    // style if it does).
     private func mapAuthState(_ state: AuthorizationState) -> AuthState {
         switch state {
         case .authorizationStateWaitTdlibParameters: return .waitTdlibParameters
         case .authorizationStateWaitPhoneNumber: return .waitPhoneNumber
-        case .authorizationStateWaitCode: return .waitCode
-        case .authorizationStateWaitPassword: return .waitPassword
-        case .authorizationStateWaitRegistration: return .waitRegistration
-        case .authorizationStateWaitOtherDeviceConfirmation: return .waitOtherDeviceConfirmation
+        // Premium-purchase and e-mail auth are not part of this app's
+        // login UI; they map to the closest state the UI knows.
+        case .authorizationStateWaitPremiumPurchase(_): return .waitPhoneNumber
+        case .authorizationStateWaitEmailAddress(_): return .waitPhoneNumber
+        case .authorizationStateWaitEmailCode(_): return .waitCode
+        case .authorizationStateWaitCode(_): return .waitCode
+        case .authorizationStateWaitOtherDeviceConfirmation(_): return .waitOtherDeviceConfirmation
+        case .authorizationStateWaitRegistration(_): return .waitRegistration
+        case .authorizationStateWaitPassword(_): return .waitPassword
         case .authorizationStateReady: return .ready
         case .authorizationStateLoggingOut: return .loggingOut
         case .authorizationStateClosing: return .closing
@@ -85,7 +134,7 @@ final class TDLibKitAdapter: TelegramClient {
 
     private func mapFile(_ file: File) -> RemoteFile {
         RemoteFile(
-            id: file.id,
+            id: Int32(file.id),
             size: file.size,
             localPath: file.local.path,
             isDownloadingCompleted: file.local.isDownloadingCompleted,
@@ -94,15 +143,12 @@ final class TDLibKitAdapter: TelegramClient {
         )
     }
 
-    // TODO(TDLibKit): verify MessageContent case spellings and payload
-    // struct field names (MessageDocument.document / .caption,
-    // MessagePhoto.photo.sizes, MessageText.text).
     private func mapMessage(_ message: Message) -> ChatMessage {
         switch message.content {
         case .messageDocument(let doc):
             let tdFile = doc.document.document
             let file = RemoteFile(
-                id: tdFile.id,
+                id: Int32(tdFile.id),
                 size: tdFile.size,
                 localPath: tdFile.local.path,
                 isDownloadingCompleted: tdFile.local.isDownloadingCompleted,
@@ -128,41 +174,40 @@ final class TDLibKitAdapter: TelegramClient {
 
     func setTdlibParameters(_ parameters: TdlibParameters) async throws {
         guard let client else { throw AdapterError.noClient }
-        // TODO(TDLibKit): verify TdlibParameters field names and the
-        // apiVersion value.
-        let tdlibParameters = TdlibParameters(
-            apiId: parameters.apiId,
+        // 1.8.66 takes the fields flattened (no TdlibParameters object,
+        // no apiVersion / enableStorageOptimizer / ignoreBackgroundUpdates).
+        // useTestDc is always false for this app; databaseEncryptionKey is
+        // empty (no encryption); systemLanguageCode defaults to English.
+        try await client.setTdlibParameters(
             apiHash: parameters.apiHash,
-            deviceModel: parameters.deviceModel,
-            systemVersion: parameters.systemVersion,
+            apiId: Int(parameters.apiId),
             applicationVersion: parameters.applicationVersion,
-            useTestDc: false,
             databaseDirectory: parameters.databaseDirectory,
+            databaseEncryptionKey: Data(),
+            deviceModel: parameters.deviceModel,
             filesDirectory: parameters.filesDirectory,
-            databaseEncryptionKey: [],
-            useFileDatabase: parameters.useFileDatabase,
+            systemLanguageCode: "en",
+            systemVersion: parameters.systemVersion,
             useChatInfoDatabase: parameters.useChatInfoDatabase,
+            useFileDatabase: parameters.useFileDatabase,
             useMessageDatabase: parameters.useMessageDatabase,
             useSecretChats: parameters.useSecretChats,
-            apiVersion: "1.8.69",
-            enableStorageOptimizer: parameters.enableStorageOptimizer,
-            ignoreBackgroundUpdates: false
+            useTestDc: false
         )
-        try await client.setTdlibParameters(parameters: tdlibParameters)
     }
 
     func setAuthenticationPhoneNumber(_ phoneNumber: String) async throws {
         guard let client else { throw AdapterError.noClient }
-        // TODO(TDLibKit): verify setAuthenticationPhoneNumber labels and
-        // the AuthenticationCodeSettings initializer.
         try await client.setAuthenticationPhoneNumber(
             phoneNumber: phoneNumber,
-            settings: AuthenticationCodeSettings(
+            settings: PhoneNumberAuthenticationSettings(
                 allowFlashCall: false,
                 allowMissedCall: false,
                 allowSmsRetrieverApi: false,
+                authenticationTokens: [],
                 firebaseAuthenticationSettings: nil,
-                authenticationTokens: []
+                hasUnknownPhoneNumber: false,
+                isCurrentPhoneNumber: false
             )
         )
     }
@@ -179,15 +224,48 @@ final class TDLibKitAdapter: TelegramClient {
 
     func requestQrCodeAuthentication() async throws -> String {
         guard let client else { throw AdapterError.noClient }
-        // TODO(TDLibKit): verify requestQrCodeAuthentication returns Link
-        // and the field name for the URL.
-        let link = try await client.requestQrCodeAuthentication(otherUserIds: [])
-        return link.link
+        // Returns Ok; the tg:// link arrives in the next
+        // authorizationStateWaitOtherDeviceConfirmation update.
+        try await client.requestQrCodeAuthentication(otherUserIds: [])
+        return try await waitForQrLink()
+    }
+
+    private func waitForQrLink() async throws -> String {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+            let id = UUID()
+            waitLock.lock()
+            if let link = qrLink {
+                waitLock.unlock()
+                continuation.resume(returning: link)
+                return
+            }
+            qrWaiters[id] = continuation
+            waitLock.unlock()
+            Task {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                self.waitLock.lock()
+                if let waiter = self.qrWaiters.removeValue(forKey: id) {
+                    self.waitLock.unlock()
+                    waiter.resume(throwing: AdapterError.timeout)
+                } else {
+                    self.waitLock.unlock()
+                }
+            }
+        }
+    }
+
+    private func deliverQrLink(_ link: String) {
+        waitLock.lock()
+        qrLink = link
+        let waiters = qrWaiters
+        qrWaiters.removeAll()
+        waitLock.unlock()
+        for waiter in waiters.values { waiter.resume(returning: link) }
     }
 
     func confirmQrCodeAuthentication(link: String) async throws {
         guard let client else { throw AdapterError.noClient }
-        try await client.confirmQrCodeAuthentication(link: link)
+        _ = try await client.confirmQrCodeAuthentication(link: link)
     }
 
     // MARK: - Saved Messages
@@ -200,58 +278,89 @@ final class TDLibKitAdapter: TelegramClient {
 
     func getSavedMessagesTopics() async throws -> [SavedTopic] {
         guard let client else { throw AdapterError.noClient }
-        // TODO(TDLibKit): verify SavedMessagesTopics shape and how a topic
-        // maps to a history id (see topicId(of:) below).
-        let result = try await client.getSavedMessagesTopics()
-        return result.topics.map { topic in
-            SavedTopic(id: topicId(of: topic), name: topicName(of: topic), messageCount: 0)
+        // No getter in 1.8.66: loading triggers one
+        // updateSavedMessagesTopic per topic (plus a count update). A 404
+        // from load just means everything was already loaded, so it is
+        // ignored and the cache is returned.
+        try? await client.loadSavedMessagesTopics(limit: 100)
+        return await waitForTopics()
+    }
+
+    private func waitForTopics() async -> [SavedTopic] {
+        await withCheckedContinuation { (continuation: CheckedContinuation<[SavedTopic], Never>) in
+            let id = UUID()
+            waitLock.lock()
+            let done = topicsExpectedCount.map { topicsCache.count >= $0 } ?? false
+            if done {
+                let topics = sortedTopicsLocked()
+                waitLock.unlock()
+                continuation.resume(returning: topics)
+                return
+            }
+            topicsWaiters[id] = continuation
+            waitLock.unlock()
+            Task {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                self.waitLock.lock()
+                if let waiter = self.topicsWaiters.removeValue(forKey: id) {
+                    let topics = self.sortedTopicsLocked()
+                    self.waitLock.unlock()
+                    waiter.resume(returning: topics)
+                } else {
+                    self.waitLock.unlock()
+                }
+            }
         }
     }
 
-    /// Maps a TDLib SavedMessagesTopic to the id getSavedMessagesTopicHistory
-    /// expects. TL: My Notes is topic 0; an author topic is identified by
-    /// the author's user id.
-    /// TODO(TDLibKit): verify the SavedMessagesTopicType enum case spellings
-    /// and payload shapes (e.g. whether the author case carries a struct
-    /// with a userId field).
-    private func topicId(of topic: SavedMessagesTopic) -> Int64 {
-        switch topic.type {
-        case .savedMessagesTopicTypeMyNotes:
-            return 0
-        case .savedMessagesTopicTypeAuthor(let author):
-            return author.userId
+    private func maybeResumeTopics() {
+        waitLock.lock()
+        guard let expected = topicsExpectedCount, topicsCache.count >= expected, !topicsWaiters.isEmpty else {
+            waitLock.unlock()
+            return
         }
+        let waiters = topicsWaiters
+        topicsWaiters.removeAll()
+        let topics = sortedTopicsLocked()
+        waitLock.unlock()
+        for waiter in waiters.values { waiter.resume(returning: topics) }
+    }
+
+    /// Call with `waitLock` held.
+    private func sortedTopicsLocked() -> [SavedTopic] {
+        topicsCache.values
+            .sorted { $0.order > $1.order }
+            .map { SavedTopic(id: $0.id, name: topicName(of: $0), messageCount: 0) }
     }
 
     private func topicName(of topic: SavedMessagesTopic) -> String {
         switch topic.type {
         case .savedMessagesTopicTypeMyNotes:
             return "My Notes"
-        case .savedMessagesTopicTypeAuthor(let author):
-            return "User \(author.userId)"
+        case .savedMessagesTopicTypeAuthorHidden:
+            return "Hidden author"
+        case .savedMessagesTopicTypeSavedFromChat(let savedFrom):
+            return "Chat \(savedFrom.chatId)"
         }
     }
 
     func getSavedMessagesTopicHistory(topicId: Int64, fromMessageId: Int64, limit: Int32) async throws -> [ChatMessage] {
         guard let client else { throw AdapterError.noClient }
-        // TODO(TDLibKit): verify parameter labels and the Messages shape.
         // History is reverse-chronological; fromMessageId 0 = latest,
         // limit <= 100.
         let result = try await client.getSavedMessagesTopicHistory(
             savedMessagesTopicId: topicId,
             fromMessageId: fromMessageId,
             offset: 0,
-            limit: limit
+            limit: Int(limit)
         )
-        return result.messages.map(mapMessage)
+        return (result.messages ?? []).map(mapMessage)
     }
 
     // MARK: - Send / download
 
     func sendDocument(chatId: Int64, threadId: Int64, localPath: String, thumbnailPath: String?, caption: String) async throws -> ChatMessage {
         guard let client else { throw AdapterError.noClient }
-        // TODO(TDLibKit): verify InputMessageDocument / InputThumbnail
-        // initializers and the sendMessage parameter labels.
         let thumbnail: InputThumbnail? = thumbnailPath.map {
             InputThumbnail(
                 thumbnail: .inputFileLocal(InputFileLocal(path: $0)),
@@ -261,19 +370,21 @@ final class TDLibKitAdapter: TelegramClient {
         }
         let content = InputMessageContent.inputMessageDocument(
             InputMessageDocument(
-                document: .inputFileLocal(InputFileLocal(path: localPath)),
-                thumbnail: thumbnail,
-                disableContentTypeDetection: true,
-                caption: FormattedText(text: caption, entities: nil)
+                caption: FormattedText(text: caption, entities: []),
+                document: InputDocument(
+                    disableContentTypeDetection: true,
+                    document: .inputFileLocal(InputFileLocal(path: localPath)),
+                    thumbnail: thumbnail
+                )
             )
         )
         let message = try await client.sendMessage(
             chatId: chatId,
-            messageThreadId: threadId,
-            replyTo: nil,
+            inputMessageContent: content,
             options: nil,
             replyMarkup: nil,
-            inputMessageContent: content
+            replyTo: nil,
+            topicId: .messageTopicSavedMessages(MessageTopicSavedMessages(savedMessagesTopicId: threadId))
         )
         return mapMessage(message)
     }
@@ -282,9 +393,9 @@ final class TDLibKitAdapter: TelegramClient {
         guard let client else { throw AdapterError.noClient }
         // We ask for a synchronous download: the call returns when the file
         // is complete. Progress still arrives via updateFile (see
-        // FileDownloadService). TODO(TDLibKit): verify the parameter labels.
+        // FileDownloadService).
         let file = try await client.downloadFile(
-            fileId: fileId,
+            fileId: Int(fileId),
             priority: 1,
             offset: 0,
             limit: 0,
@@ -295,17 +406,25 @@ final class TDLibKitAdapter: TelegramClient {
 
     func cancelDownload(fileId: Int32) async throws {
         guard let client else { throw AdapterError.noClient }
-        try await client.cancelDownloadFile(fileId: fileId, onlyIfPending: false)
+        try await client.cancelDownloadFile(fileId: Int(fileId), onlyIfPending: false)
     }
 
     func getFile(fileId: Int32) async throws -> RemoteFile {
         guard let client else { throw AdapterError.noClient }
-        return mapFile(try await client.getFile(fileId: fileId))
+        return mapFile(try await client.getFile(fileId: Int(fileId)))
     }
 
     func close() async {
         manager.closeClients()
         client = nil
+        waitLock.lock()
+        let qrPending = qrWaiters
+        qrWaiters.removeAll()
+        let topicsPending = topicsWaiters
+        topicsWaiters.removeAll()
+        waitLock.unlock()
+        for waiter in qrPending.values { waiter.resume(throwing: AdapterError.noClient) }
+        for waiter in topicsPending.values { waiter.resume(returning: []) }
         updatesContinuation.finish()
     }
 }
